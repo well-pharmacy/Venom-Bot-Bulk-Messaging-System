@@ -1255,16 +1255,64 @@ func formatPhoneNumber(phone string) string {
 	return phone
 }
 
-// sendMessagesToCustomers sends messages to all customers
+// sendMessagesToCustomers sends messages to all customers with anti-blocking features
 func sendMessagesToCustomers(ctx context.Context, client *whatsmeow.Client, customers []ProcessedCustomer) {
 	log.Info(fmt.Sprintf("Starting to send messages to %d customers", len(customers)))
 
 	for i, customer := range customers {
+		// Check for cancellation first
 		select {
 		case <-ctx.Done():
-			log.Warning("Shutdown requested, stopping")
+			log.Warning("Operation cancelled by user")
 			return
 		default:
+		}
+
+		// Check business hours
+		if !isBusinessHours() {
+			displayWarning("Outside Business Hours",
+				"Current time is outside business hours (9 AM - 9 PM)",
+				[]string{
+					"Pausing until business hours resume",
+					"Press Ctrl+C to cancel",
+				})
+
+			// Wait until business hours
+			for !isBusinessHours() {
+				time.Sleep(5 * time.Minute)
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+			}
+			log.Info("Business hours resumed, continuing...")
+		}
+
+		// Check rate limits
+		canSend, limitMsg := checkRateLimits()
+		if !canSend {
+			displayWarning("Rate Limit Reached", limitMsg,
+				[]string{
+					"Pausing to respect rate limits",
+					"This prevents account blocking",
+					"Progress will resume automatically",
+				})
+
+			// Wait and check again
+			for {
+				time.Sleep(5 * time.Minute)
+				canSend, _ = checkRateLimits()
+				if canSend {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+			}
+			log.Info("Rate limits reset, continuing...")
 		}
 
 		isWarmup := i < 5
@@ -1275,18 +1323,31 @@ func sendMessagesToCustomers(ctx context.Context, client *whatsmeow.Client, cust
 		// Send message with retry
 		result := sendMessageWithRetry(client, customer, isWarmup)
 
-		// Calculate delay
+		// Calculate delay with anti-blocking features
 		delay := getRandomDelay(isWarmup)
 		progress.Delays = append(progress.Delays, delay)
 
 		// Record result
 		recordResult(result)
 
+		// Increment rate limiters only on successful send
+		if result.Success {
+			incrementRateLimiters()
+		}
+
 		// Check for batch break
 		if shouldTakeBatchBreak(i + 1) {
 			clearProgress()
 			log.Info(fmt.Sprintf("Batch completed. Taking %d second break...", config.BatchDelay/1000))
 			displayStats()
+
+			// Show rate limit status
+			displayInfo("Rate Limit Status",
+				fmt.Sprintf("Sent %d/%d this hour, %d/%d today",
+					progress.HourlySent, config.HourlyLimit,
+					progress.DailySent, config.DailyLimit),
+				nil)
+
 			time.Sleep(time.Duration(config.BatchDelay) * time.Millisecond)
 			log.Info("Resuming...")
 		} else {
@@ -1360,23 +1421,23 @@ func getRandomDelay(isWarmup bool) int {
 	if isWarmup {
 		return config.WarmupDelay
 	}
-	
+
 	// Base delay
 	baseDelay := config.DelayMin + rand.Intn(config.DelayMax-config.DelayMin+1)
-	
+
 	// Add micro-jitter if enabled (±0.5-2 seconds)
 	if config.AddJitter {
 		jitter := rand.Intn(2000) - 500 // -500ms to +1500ms
 		baseDelay += jitter
 	}
-	
+
 	// Occasional long pause (default 5% chance)
 	if rand.Float32() < config.LongPauseChance {
 		longPause := 30000 + rand.Intn(30000) // 30-60 seconds
 		log.Info(fmt.Sprintf("Taking extended pause: %d seconds", longPause/1000))
 		return baseDelay + longPause
 	}
-	
+
 	return baseDelay
 }
 
@@ -1385,48 +1446,48 @@ func isBusinessHours() bool {
 	if !config.BusinessHoursOnly {
 		return true // No restriction
 	}
-	
+
 	now := time.Now()
 	hour := now.Hour()
-	
+
 	// Business hours: 9 AM to 9 PM
 	if hour < 9 || hour >= 21 {
 		return false
 	}
-	
+
 	return true
 }
 
 // checkRateLimits checks if we can send more messages
 func checkRateLimits() (bool, string) {
 	now := time.Now()
-	
+
 	// Reset hourly counter if needed
 	if now.Sub(progress.LastHourReset) >= time.Hour {
 		progress.HourlySent = 0
 		progress.LastHourReset = now
 	}
-	
+
 	// Reset daily counter if needed
 	if now.Sub(progress.LastDayReset) >= 24*time.Hour {
 		progress.DailySent = 0
 		progress.LastDayReset = now
 	}
-	
+
 	// Check hourly limit
 	if progress.HourlySent >= config.HourlyLimit {
 		minutesLeft := 60 - int(now.Sub(progress.LastHourReset).Minutes())
-		return false, fmt.Sprintf("Hourly limit reached (%d/%d). Wait %d minutes.", 
+		return false, fmt.Sprintf("Hourly limit reached (%d/%d). Wait %d minutes.",
 			progress.HourlySent, config.HourlyLimit, minutesLeft)
 	}
-	
+
 	// Check daily limit
 	if progress.DailySent >= config.DailyLimit {
 		hoursLeft := 24 - int(now.Sub(progress.LastDayReset).Hours())
-		return false, fmt.Sprintf("Daily limit reached (%d/%d). Wait %d hours.", 
+		return false, fmt.Sprintf("Daily limit reached (%d/%d). Wait %d hours.",
 			progress.DailySent, config.DailyLimit, hoursLeft)
 	}
-	
+
 	return true, ""
 }
 
@@ -1441,15 +1502,15 @@ func simulateTypingDelay(message string) {
 	if !config.SimulateTyping {
 		return
 	}
-	
+
 	// Calculate typing time (40-60 characters per second)
 	charsPerSecond := 40 + rand.Intn(20)
 	typingTimeMs := (len(message) * 1000) / charsPerSecond
-	
+
 	// Add some randomness (±20%)
 	variation := int(float64(typingTimeMs) * 0.2)
 	typingTimeMs += rand.Intn(variation*2) - variation
-	
+
 	// Minimum 1 second, maximum 10 seconds
 	if typingTimeMs < 1000 {
 		typingTimeMs = 1000
@@ -1457,7 +1518,7 @@ func simulateTypingDelay(message string) {
 	if typingTimeMs > 10000 {
 		typingTimeMs = 10000
 	}
-	
+
 	time.Sleep(time.Duration(typingTimeMs) * time.Millisecond)
 }
 
